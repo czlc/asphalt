@@ -63,7 +63,7 @@ There are three targets you can use to sync assets:
 
 -   `cloud`: Uploads your assets to Roblox. This will generate a `asphalt.lock.toml` file which you should commit to source control. This is the default target.
 
--   `studio`: Syncs assets locally to Roblox Studio. This is useful for testing assets in Studio before uploading them to Roblox.
+-   `studio`: Syncs assets locally to Roblox Studio. This is useful for testing assets in Studio before uploading them to Roblox. Models and animations still require cloud asset IDs, so Studio sync will upload missing models and animations when an API key is available, then record them in `asphalt.lock.toml`.
 
 -   `debug`: Syncs assets to an `.asphalt-debug` folder in the current directory. You can use this option see how Asphalt will process your files.
 

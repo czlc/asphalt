@@ -126,6 +126,7 @@ async fn process_entry(
         .params
         .existing_lockfile
         .get(&state.input_name, &asset.hash);
+    let lockfile_missing = lockfile_entry.is_none();
 
     {
         let mut seen_hashes = state.seen_hashes.lock().await;
@@ -156,7 +157,7 @@ async fn process_entry(
     }
 
     let always_target = matches!(state.params.target, SyncTarget::Studio | SyncTarget::Debug);
-    let is_new = always_target || lockfile_entry.is_none();
+    let is_new = always_target || lockfile_missing;
 
     if is_new {
         let font_db = state.params.font_db.clone();
@@ -177,7 +178,10 @@ async fn process_entry(
     };
 
     let event = super::Event::Finished {
-        state: super::EventState::Synced { new: is_new },
+        state: super::EventState::Synced {
+            new: is_new,
+            lockfile_missing,
+        },
         input_name: state.input_name.clone(),
         path: path.into(),
         rel_path: asset.path.clone(),

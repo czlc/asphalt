@@ -9,7 +9,7 @@ use std::{
 
 pub const FILE_NAME: &str = "asphalt.lock.toml";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Lockfile {
     version: u32,
     inputs: BTreeMap<String, BTreeMap<Hash, LockfileEntry>>,
@@ -39,6 +39,12 @@ impl Lockfile {
             .entry(input_name.to_string())
             .or_default()
             .insert(hash.to_owned(), entry);
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        for (input_name, entries) in other.inputs {
+            self.inputs.entry(input_name).or_default().extend(entries);
+        }
     }
 
     pub async fn write_to(&self, project_dir: &Path) -> anyhow::Result<()> {
@@ -157,4 +163,29 @@ async fn migrate_from_v0(lockfile: &LockfileV0, input_name: &str) -> anyhow::Res
     }
 
     Ok(new_lockfile)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_preserves_existing_entries() {
+        let existing_hash = Hash::new_from_bytes(b"image");
+        let uploaded_hash = Hash::new_from_bytes(b"animation");
+
+        let mut existing = Lockfile::default();
+        existing.insert("assets", &existing_hash, LockfileEntry { asset_id: 1 });
+
+        let mut uploaded = Lockfile::default();
+        uploaded.insert("animations", &uploaded_hash, LockfileEntry { asset_id: 2 });
+
+        existing.merge(uploaded);
+
+        assert_eq!(existing.get("assets", &existing_hash).unwrap().asset_id, 1);
+        assert_eq!(
+            existing.get("animations", &uploaded_hash).unwrap().asset_id,
+            2
+        );
+    }
 }

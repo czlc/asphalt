@@ -3,6 +3,7 @@ use crate::{
     asset::{Asset, AssetType},
     lockfile::LockfileEntry,
     sync::backend::Params,
+    web_api::WebApiClient,
 };
 use anyhow::Context;
 use fs_err::tokio as fs;
@@ -14,10 +15,11 @@ use std::{env, path::PathBuf};
 pub struct Studio {
     identifier: String,
     sync_path: PathBuf,
+    cloud: Option<WebApiClient>,
 }
 
 impl Backend for Studio {
-    async fn new(_: Params) -> anyhow::Result<Self>
+    async fn new(params: Params) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
@@ -48,6 +50,9 @@ impl Backend for Studio {
         Ok(Self {
             identifier,
             sync_path,
+            cloud: params
+                .api_key
+                .map(|api_key| WebApiClient::new(api_key, params.creator, params.expected_price)),
         })
     }
 
@@ -60,10 +65,23 @@ impl Backend for Studio {
             return match lockfile_entry {
                 Some(entry) => Ok(Some(AssetRef::Cloud(entry.asset_id))),
                 None => {
-                    warn!(
-                        "Models and Animations cannot be synced to Studio without having been uploaded first"
+                    let Some(client) = &self.cloud else {
+                        warn!(
+                            "Models and Animations cannot be synced to Studio without having been uploaded first or providing an API key"
+                        );
+                        return Ok(None);
+                    };
+
+                    info!(
+                        "Uploading model or animation for Studio sync: {}",
+                        asset.path
                     );
-                    Ok(None)
+                    let asset_id = client
+                        .upload(asset)
+                        .await
+                        .context("Failed to upload model or animation while syncing to Studio")?;
+
+                    Ok(Some(AssetRef::Cloud(asset_id)))
                 }
             };
         }
@@ -88,22 +106,60 @@ impl Backend for Studio {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Creator, CreatorType};
     use relative_path::RelativePathBuf;
+    use std::env;
 
     #[tokio::test]
     async fn sync_generates_single_rbxasset_uri() {
         let temp_dir = assert_fs::TempDir::new().unwrap();
-        let asset =
-            Asset::new(RelativePathBuf::from("image.png"), b"fake png".to_vec().into()).unwrap();
+        let asset = Asset::new(
+            RelativePathBuf::from("image.png"),
+            b"fake png".to_vec().into(),
+        )
+        .unwrap();
 
         let studio = Studio {
             identifier: ".asphalt-test".to_string(),
             sync_path: temp_dir.path().to_path_buf(),
+            cloud: None,
         };
 
         let asset_ref = studio.sync(&asset, None).await.unwrap().unwrap();
         let expected = format!("rbxasset://.asphalt-test/{}.png", asset.hash);
 
         assert_eq!(asset_ref.to_string(), expected);
+    }
+
+    #[tokio::test]
+    async fn sync_uploads_missing_models_when_api_key_is_available() {
+        unsafe {
+            env::set_var("ASPHALT_TEST", "true");
+        }
+
+        let temp_dir = assert_fs::TempDir::new().unwrap();
+        let asset = Asset::new(
+            RelativePathBuf::from("model.fbx"),
+            b"fake fbx".to_vec().into(),
+        )
+        .unwrap();
+        let expected_id = asset.hash.as_u64();
+
+        let studio = Studio {
+            identifier: ".asphalt-test".to_string(),
+            sync_path: temp_dir.path().to_path_buf(),
+            cloud: Some(WebApiClient::new(
+                "test".to_string(),
+                Creator {
+                    ty: CreatorType::User,
+                    id: 123,
+                },
+                None,
+            )),
+        };
+
+        let asset_ref = studio.sync(&asset, None).await.unwrap().unwrap();
+
+        assert_eq!(asset_ref.to_string(), format!("rbxassetid://{expected_id}"));
     }
 }

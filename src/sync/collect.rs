@@ -28,8 +28,10 @@ pub async fn collect_events(
     inputs: InputMap,
     mp: MultiProgress,
     base_dir: &std::path::Path,
+    existing_lockfile: Lockfile,
 ) -> anyhow::Result<CollectResults> {
     let mut new_lockfile = Lockfile::default();
+    let mut incremental_lockfile = existing_lockfile;
     let mut hash_refs = HashMap::<(String, Hash), AssetRef>::new();
     let mut pending_duplicates = HashMap::<(String, Hash), Vec<RelativePathBuf>>::new();
 
@@ -87,7 +89,12 @@ pub async fn collect_events(
 
                         progress.dupes += 1;
                     }
-                    super::EventState::Synced { new } => {
+                    super::EventState::Synced {
+                        new,
+                        lockfile_missing,
+                    } => {
+                        let mut should_write_incremental_lockfile = false;
+
                         if let Some(asset_ref) = asset_ref {
                             let key = (input_name.clone(), hash);
                             hash_refs.insert(key.clone(), asset_ref.clone());
@@ -102,19 +109,24 @@ pub async fn collect_events(
                             }
 
                             if let AssetRef::Cloud(id) = asset_ref {
-                                new_lockfile.insert(
-                                    &input_name,
-                                    &hash,
-                                    LockfileEntry { asset_id: id },
-                                );
+                                let entry = LockfileEntry { asset_id: id };
+                                new_lockfile.insert(&input_name, &hash, entry.clone());
+
+                                let mut incremental_entry = Lockfile::default();
+                                incremental_entry.insert(&input_name, &hash, entry);
+                                incremental_lockfile.merge(incremental_entry);
+
+                                should_write_incremental_lockfile = lockfile_missing
+                                    && (target.write_on_sync()
+                                        || matches!(target, SyncTarget::Studio));
                             }
                         }
                         progress.synced += 1;
 
                         if new {
                             progress.new += 1;
-                            if target.write_on_sync() {
-                                new_lockfile.write_to(base_dir).await?;
+                            if should_write_incremental_lockfile {
+                                incremental_lockfile.write_to(base_dir).await?;
                             }
                         }
                     }
@@ -224,5 +236,72 @@ impl Progress {
         self.inner.set_prefix("Synced");
         self.inner.set_style(Progress::get_style(true));
         self.inner.finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        lockfile::RawLockfile,
+        sync::{Event, EventState},
+    };
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn studio_incremental_write_preserves_existing_lockfile_entries() {
+        let temp_dir = assert_fs::TempDir::new().unwrap();
+        let existing_hash = Hash::new_from_bytes(b"image");
+        let uploaded_hash = Hash::new_from_bytes(b"animation");
+
+        let mut existing_lockfile = Lockfile::default();
+        existing_lockfile.insert("images", &existing_hash, LockfileEntry { asset_id: 1 });
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Event::Finished {
+            state: EventState::Synced {
+                new: true,
+                lockfile_missing: true,
+            },
+            input_name: "animations".to_string(),
+            path: PathBuf::from("animations/walk.fbx"),
+            rel_path: RelativePathBuf::from("walk.fbx"),
+            hash: uploaded_hash,
+            asset_ref: Some(AssetRef::Cloud(2)),
+        })
+        .unwrap();
+        drop(tx);
+
+        collect_events(
+            rx,
+            SyncTarget::Studio,
+            HashMap::new(),
+            MultiProgress::new(),
+            temp_dir.path(),
+            existing_lockfile,
+        )
+        .await
+        .unwrap();
+
+        let written_lockfile = RawLockfile::read_from(temp_dir.path())
+            .await
+            .unwrap()
+            .into_lockfile()
+            .unwrap();
+
+        assert_eq!(
+            written_lockfile
+                .get("images", &existing_hash)
+                .unwrap()
+                .asset_id,
+            1
+        );
+        assert_eq!(
+            written_lockfile
+                .get("animations", &uploaded_hash)
+                .unwrap()
+                .asset_id,
+            2
+        );
     }
 }

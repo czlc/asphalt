@@ -57,7 +57,7 @@ enum Event {
 
 #[derive(Debug)]
 enum EventState {
-    Synced { new: bool },
+    Synced { new: bool, lockfile_missing: bool },
     Duplicate,
 }
 
@@ -68,6 +68,7 @@ pub async fn sync(args: SyncArgs, mp: MultiProgress) -> anyhow::Result<()> {
     let existing_lockfile = RawLockfile::read_from(&config.project_dir)
         .await?
         .into_lockfile()?;
+    let collector_lockfile = existing_lockfile.clone();
 
     let font_db = Arc::new({
         let mut db = fontdb::Database::new();
@@ -80,7 +81,17 @@ pub async fn sync(args: SyncArgs, mp: MultiProgress) -> anyhow::Result<()> {
     let collector_handle = tokio::spawn({
         let inputs = config.inputs.clone();
         let project_dir = config.project_dir.clone();
-        async move { collect_events(event_rx, target, inputs, mp, &project_dir).await }
+        async move {
+            collect_events(
+                event_rx,
+                target,
+                inputs,
+                mp,
+                &project_dir,
+                collector_lockfile,
+            )
+            .await
+        }
     });
 
     let params = walk::Params {
