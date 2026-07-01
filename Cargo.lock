@@ -163,8 +163,11 @@ dependencies = [
  "indicatif-log-bridge",
  "insta",
  "log",
+ "lz4_flex",
  "predicates",
  "rbx_binary",
+ "rbx_dom_weak",
+ "rbx_reflection",
  "rbx_xml",
  "relative-path",
  "reqwest",
@@ -176,6 +179,7 @@ dependencies = [
  "tokio",
  "toml",
  "walkdir",
+ "zstd",
 ]
 
 [[package]]

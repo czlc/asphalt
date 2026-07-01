@@ -6,11 +6,7 @@ use anyhow::{Context, bail};
 use log::{debug, warn};
 use reqwest::{RequestBuilder, Response, StatusCode, multipart};
 use serde::{Deserialize, Serialize};
-use std::{
-    env,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
-};
+use std::{env, time::Duration};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
@@ -26,7 +22,7 @@ pub struct WebApiClient {
     api_key: String,
     creator: config::Creator,
     expected_price: Option<u32>,
-    fatally_failed: AtomicBool,
+    fatal_error: Mutex<Option<String>>,
     /// Shared rate limit state: when we can next make a request
     rate_limit_reset: Mutex<Option<Instant>>,
 }
@@ -38,7 +34,7 @@ impl WebApiClient {
             api_key,
             creator,
             expected_price,
-            fatally_failed: AtomicBool::new(false),
+            fatal_error: Mutex::new(None),
             rate_limit_reset: Mutex::new(None),
         }
     }
@@ -119,8 +115,10 @@ impl WebApiClient {
             if operation.done {
                 if let Some(response) = operation.response {
                     return Ok(response.asset_id.parse()?);
+                } else if let Some(error) = operation.error {
+                    bail!("Operation failed:\n{error}");
                 } else {
-                    bail!("Operation completed but no response provided");
+                    bail!("Operation completed but no response provided:\n{text}");
                 }
             }
 
@@ -139,8 +137,8 @@ impl WebApiClient {
     where
         F: Fn(&reqwest::Client) -> RequestBuilder,
     {
-        if self.fatally_failed.load(Ordering::SeqCst) {
-            bail!("A previous request failed due to a fatal error");
+        if let Some(error) = self.fatal_error.lock().await.clone() {
+            bail!("A previous request failed due to a fatal error:\n{error}");
         }
 
         const MAX: u8 = 5;
@@ -189,11 +187,12 @@ impl WebApiClient {
 
                     continue;
                 }
-                StatusCode::OK => return Ok(res),
+                status if status.is_success() => return Ok(res),
                 _ => {
                     let body = res.text().await?;
-                    self.fatally_failed.store(true, Ordering::SeqCst);
-                    bail!("Request failed with status {status}:\n{body}");
+                    let error = format!("Request failed with status {status}:\n{body}");
+                    *self.fatal_error.lock().await = Some(error.clone());
+                    bail!("{error}");
                 }
             }
         }
@@ -254,6 +253,7 @@ struct Operation {
     done: bool,
     operation_id: String,
     response: Option<OperationResponse>,
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]

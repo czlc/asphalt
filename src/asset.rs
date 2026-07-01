@@ -4,13 +4,19 @@ use crate::{
     lockfile::LockfileEntry,
     util::{alpha_bleed::alpha_bleed, svg::svg_to_png},
 };
-use anyhow::Context;
+use anyhow::{Context, bail};
 use bytes::Bytes;
 use image::DynamicImage;
 use relative_path::RelativePathBuf;
 use resvg::usvg::fontdb::{self};
 use serde::Serialize;
-use std::{ffi::OsStr, fmt, io::Cursor, sync::Arc};
+use std::{
+    collections::HashMap,
+    ffi::OsStr,
+    fmt,
+    io::{Cursor, Read},
+    sync::Arc,
+};
 
 type AssetCtor = fn(&[u8]) -> anyhow::Result<AssetType>;
 
@@ -201,25 +207,220 @@ pub enum VideoType {
 }
 
 pub fn is_animation(data: &[u8], format: &RobloxModelFormat) -> anyhow::Result<bool> {
-    let dom = match format {
-        RobloxModelFormat::Binary => rbx_binary::from_reader(data)?,
-        RobloxModelFormat::Xml => rbx_xml::from_reader(data, Default::default())?,
+    let first_class = match format {
+        RobloxModelFormat::Binary => first_binary_root_class(data)?,
+        RobloxModelFormat::Xml => {
+            let dom = rbx_xml::from_reader(data, Default::default())?;
+            let children = dom.root().children();
+
+            let first_ref = *children.first().context("No children found in root")?;
+            let first = dom
+                .get_by_ref(first_ref)
+                .context("Failed to get first child")?;
+
+            first.class.to_string()
+        }
     };
 
-    let children = dom.root().children();
+    Ok(is_animation_class(&first_class))
+}
 
-    let first_ref = *children.first().context("No children found in root")?;
-    let first = dom
-        .get_by_ref(first_ref)
-        .context("Failed to get first child")?;
-
-    Ok(first.class == "KeyframeSequence" || first.class == "CurveAnimation")
+fn is_animation_class(class: &str) -> bool {
+    class == "KeyframeSequence" || class == "CurveAnimation"
 }
 
 #[derive(Debug, Clone)]
 pub enum RobloxModelFormat {
     Binary,
     Xml,
+}
+
+const RBXM_MAGIC_HEADER: &[u8; 8] = b"<roblox!";
+const RBXM_SIGNATURE: &[u8; 6] = b"\x89\xff\x0d\x0a\x1a\x0a";
+const RBXM_FILE_VERSION: u16 = 0;
+const ZSTD_MAGIC_NUMBER: &[u8; 4] = &[0x28, 0xb5, 0x2f, 0xfd];
+
+struct BinaryChunk {
+    name: [u8; 4],
+    data: Vec<u8>,
+}
+
+fn first_binary_root_class(data: &[u8]) -> anyhow::Result<String> {
+    let mut reader = Cursor::new(data);
+    read_binary_header(&mut reader)?;
+
+    let mut classes_by_ref = HashMap::new();
+
+    loop {
+        let chunk = read_binary_chunk(&mut reader)?;
+
+        match &chunk.name {
+            b"INST" => read_inst_chunk(&chunk.data, &mut classes_by_ref)?,
+            b"PRNT" => {
+                if let Some(class) = read_first_root_class(&chunk.data, &classes_by_ref)? {
+                    return Ok(class);
+                }
+            }
+            b"END\0" => break,
+            _ => {}
+        }
+    }
+
+    bail!("No children found in root")
+}
+
+fn read_binary_header<R: Read>(reader: &mut R) -> anyhow::Result<()> {
+    let magic_header = read_exact::<8, _>(reader)?;
+    if &magic_header != RBXM_MAGIC_HEADER {
+        bail!("Invalid Roblox binary model header");
+    }
+
+    let signature = read_exact::<6, _>(reader)?;
+    if &signature != RBXM_SIGNATURE {
+        bail!("Invalid Roblox binary model signature");
+    }
+
+    let version = read_le_u16(reader)?;
+    if version != RBXM_FILE_VERSION {
+        bail!("Unknown Roblox binary model version {version}");
+    }
+
+    let _num_types = read_le_u32(reader)?;
+    let _num_instances = read_le_u32(reader)?;
+
+    let reserved = read_exact::<8, _>(reader)?;
+    if reserved != [0; 8] {
+        bail!("Invalid Roblox binary model reserved header bytes");
+    }
+
+    Ok(())
+}
+
+fn read_binary_chunk<R: Read>(reader: &mut R) -> anyhow::Result<BinaryChunk> {
+    let name = read_exact::<4, _>(reader)?;
+    let compressed_len = read_le_u32(reader)?;
+    let len = read_le_u32(reader)?;
+    let reserved = read_le_u32(reader)?;
+
+    if reserved != 0 {
+        bail!("Invalid Roblox binary chunk reserved bytes");
+    }
+
+    let data = if compressed_len == 0 {
+        read_bytes(reader, len as usize)?
+    } else {
+        let compressed_data = read_bytes(reader, compressed_len as usize)?;
+        if compressed_data.starts_with(ZSTD_MAGIC_NUMBER) {
+            zstd::bulk::decompress(&compressed_data, len as usize)?
+        } else {
+            lz4_flex::block::decompress(&compressed_data, len as usize)
+                .map_err(|e| anyhow::anyhow!(e))?
+        }
+    };
+
+    if data.len() != len as usize {
+        bail!("Invalid Roblox binary chunk length");
+    }
+
+    Ok(BinaryChunk { name, data })
+}
+
+fn read_inst_chunk(data: &[u8], classes_by_ref: &mut HashMap<i32, String>) -> anyhow::Result<()> {
+    let mut reader = Cursor::new(data);
+    let _type_id = read_le_u32(&mut reader)?;
+    let type_name = read_string(&mut reader)?;
+    let _object_format = read_u8(&mut reader)?;
+    let number_instances = read_le_u32(&mut reader)? as usize;
+    let referents = read_referent_array(&mut reader, number_instances)?;
+
+    for referent in referents {
+        classes_by_ref.insert(referent, type_name.clone());
+    }
+
+    Ok(())
+}
+
+fn read_first_root_class(
+    data: &[u8],
+    classes_by_ref: &HashMap<i32, String>,
+) -> anyhow::Result<Option<String>> {
+    let mut reader = Cursor::new(data);
+    let version = read_u8(&mut reader)?;
+    if version != 0 {
+        bail!("Unknown PRNT chunk version {version}");
+    }
+
+    let number_objects = read_le_u32(&mut reader)? as usize;
+    let subjects = read_referent_array(&mut reader, number_objects)?;
+    let parents = read_referent_array(&mut reader, number_objects)?;
+
+    for (subject, parent) in subjects.into_iter().zip(parents) {
+        if parent == -1 {
+            let class = classes_by_ref
+                .get(&subject)
+                .with_context(|| format!("Root instance {subject} was not declared"))?;
+            return Ok(Some(class.clone()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn read_exact<const N: usize, R: Read>(reader: &mut R) -> anyhow::Result<[u8; N]> {
+    let mut bytes = [0; N];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_bytes<R: Read>(reader: &mut R, len: usize) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = vec![0; len];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_u8<R: Read>(reader: &mut R) -> anyhow::Result<u8> {
+    Ok(read_exact::<1, _>(reader)?[0])
+}
+
+fn read_le_u16<R: Read>(reader: &mut R) -> anyhow::Result<u16> {
+    Ok(u16::from_le_bytes(read_exact(reader)?))
+}
+
+fn read_le_u32<R: Read>(reader: &mut R) -> anyhow::Result<u32> {
+    Ok(u32::from_le_bytes(read_exact(reader)?))
+}
+
+fn read_string<R: Read>(reader: &mut R) -> anyhow::Result<String> {
+    let len = read_le_u32(reader)? as usize;
+    let bytes = read_bytes(reader, len)?;
+    Ok(String::from_utf8(bytes)?)
+}
+
+fn read_referent_array<R: Read>(reader: &mut R, len: usize) -> anyhow::Result<Vec<i32>> {
+    let byte_len = len
+        .checked_mul(4)
+        .context("Roblox binary referent array is too large")?;
+    let buffer = read_bytes(reader, byte_len)?;
+    let mut referents = Vec::with_capacity(len);
+    let mut last = 0;
+
+    for index in 0..len {
+        let bytes = [
+            buffer[index],
+            buffer[index + len],
+            buffer[index + len * 2],
+            buffer[index + len * 3],
+        ];
+        let value = untransform_i32(i32::from_be_bytes(bytes)) + last;
+        last = value;
+        referents.push(value);
+    }
+
+    Ok(referents)
+}
+
+fn untransform_i32(value: i32) -> i32 {
+    ((value as u32) >> 1) as i32 ^ -(value & 1)
 }
 
 #[derive(Debug, Clone)]
@@ -246,5 +447,52 @@ impl From<WebAsset> for AssetRef {
 impl From<&LockfileEntry> for AssetRef {
     fn from(value: &LockfileEntry) -> Self {
         AssetRef::Cloud(value.asset_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RobloxModelFormat, is_animation};
+    use rbx_dom_weak::{
+        InstanceBuilder, WeakDom,
+        types::{Color3uint8, Tags},
+    };
+
+    fn serialize_binary_model(root: InstanceBuilder) -> Vec<u8> {
+        let dom = WeakDom::new(root);
+        let database = rbx_reflection::ReflectionDatabase::new();
+        let mut output = Vec::new();
+
+        rbx_binary::Serializer::new()
+            .reflection_database(&database)
+            .serialize(&mut output, &dom, &[dom.root_ref()])
+            .unwrap();
+
+        output
+    }
+
+    #[test]
+    fn detects_binary_animation_with_tags_property() {
+        let mut tags = Tags::new();
+        tags.push("lava");
+
+        let data = serialize_binary_model(
+            InstanceBuilder::new("KeyframeSequence")
+                .with_child(InstanceBuilder::new("Animation").with_property("Tags", tags)),
+        );
+
+        assert!(is_animation(&data, &RobloxModelFormat::Binary).unwrap());
+    }
+
+    #[test]
+    fn detects_binary_model_with_color3uint8_property() {
+        let data = serialize_binary_model(
+            InstanceBuilder::new("Model").with_child(
+                InstanceBuilder::new("MeshPart")
+                    .with_property("Color3uint8", Color3uint8::new(255, 128, 0)),
+            ),
+        );
+
+        assert!(!is_animation(&data, &RobloxModelFormat::Binary).unwrap());
     }
 }
